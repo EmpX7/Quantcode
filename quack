@@ -1,0 +1,38 @@
+from qiskit import QuantumCircuit, execute, Aer
+
+def bb84():
+    # Preparing the quantum circuit
+    qc = QuantumCircuit(2, 2)
+    
+    # Potential qubit states
+    states = ['0', '1', '+', '-']
+    
+    # Alice prepares her qubits
+    alice_state = '0'  # or '1', '+', '-'
+    if alice_state == '1':
+        qc.x(0)
+    elif alice_state == '+':
+        qc.h(0)
+    elif alice_state == '-':
+        qc.x(0)
+        qc.h(0)
+
+    # Alice sends her qubit to Bob
+    # Here, we'll skip the sending part as it's not physically possible in code
+    
+    # Bob measures his qubits
+    bob_basis = 'Z'  # or 'X'. Depicts if Bob measures in the computational or superposition basis
+    if bob_basis == 'X':
+        qc.h(1)
+    qc.measure([0, 1], [0, 1])
+    
+    # Run the quantum circuit
+    backend = Aer.get_backend('qasm_simulator')
+    job = execute(qc, backend, shots=1)
+    result = job.result()
+    counts = result.get_counts()
+    return qc, counts
+
+circuit, counts = bb84()
+print('Counts:', counts)
+circuit.draw('mpl')
