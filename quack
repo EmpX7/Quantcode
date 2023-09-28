@@ -1,5 +1,6 @@
 # other imports
 from web3.auto import w3
+from eth_account import Account
 
 # existing code above
 ...
@@ -8,18 +9,16 @@ from web3.auto import w3
 key_str = ''.join(key)
 ether_wallet_key = w3.sha3(text=key_str).hex()
 
-private_key = w3.toChecksumAddress(ether_wallet_key)
+# Generate a private key from hash of quantum key
+private_key = Account.privateKeyToAccount(ether_wallet_key)
 
 # Use the private_key here to interact with the Ethereum Blockchain
+...
 
-//This code transforms the quantum-generated key into a hex string, hashes it, and converts it to a wallet address (by focusing on Ethereum, we form a checksum address). From here, you would use the private_key to sign 
-//transactions on the Ethereum network.
+# This code transforms the quantum-generated key into a hex string, hashes it, and converts it to a wallet key.
+# From here, you would use the private_key to sign transactions on the Ethereum network.
 
-//This is quite basic and oversimplified - an actual implementation would need a complex wallet software, quantum-resistant authentication, error correction, etc. Also, mind the limitations of using the Ethereum blockchain 
-//since it is not quantum-safe by design.
-
-//This example also assumes that the BB84 QKD can be executed practically without interference or noise, which in reality wouldn't be true. In real-world implementations, noise and loss of qubits must be accounted for.
-
+# Qiskit, random imports
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 from qiskit import execute, Aer
 from random import getrandbits
@@ -45,7 +44,7 @@ alice_bases = [getrandbits(1) for _ in range(key_size)]
 # Prepare Alice's qubits
 for i in range(key_size):
     if alice_bits[i] == 1:
-        bb84.h(qr[i])
+        bb84.x(qr[i])
     if alice_bases[i] == 1:
         bb84.h(qr[i])
 
