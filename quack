@@ -1,87 +1,235 @@
-# other imports
-from web3.auto import w3
-from eth_account import Account
+#!/usr/bin/env python3
+"""
+quack — integrated demo for:
+ - BB84 simulation (local Qiskit)
+ - Quantum RNG via IBM Quantum (optional)
+ - HKDF-based safe key derivation into valid secp256k1 private key
+ - Ethereum account creation (eth_account) — demo only, never use for real funds
 
-# existing code above
-...
+Usage examples (demo-only):
+  python quack --mode bb84 --key-size 128
+  python quack --mode hkdf --entropy-file entropy.bin
+  python quack --mode integrated --source bb84
 
-# after quantum routine
-key_str = ''.join(key)
-ether_wallet_key = w3.sha3(text=key_str).hex()
+Important security notes:
+ - DO NOT use keys generated here for real funds without independent security review.
+ - This script NEVER prints private keys by default. Use --reveal-private-key only for local testing.
+ - Keep salts and reproducible entropy secret if you want to reproduce keys.
+"""
 
-# Generate a private key from hash of quantum key
-private_key = Account.privateKeyToAccount(ether_wallet_key)
-
-# Use the private_key here to interact with the Ethereum Blockchain
-...
-
-# This code transforms the quantum-generated key into a hex string, hashes it, and converts it to a wallet key.
-# From here, you would use the private_key to sign transactions on the Ethereum network.
-
-# Qiskit, random imports
-from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
-from qiskit import execute, Aer
+import os
+import sys
+import argparse
+import binascii
+import logging
 from random import getrandbits
 
-# Number of qubits used for the key
-key_size = 100
+# Optional imports (fail gracefully if not installed)
+try:
+    from qiskit import QuantumCircuit, Aer, execute
+except Exception:
+    QuantumCircuit = None
+    Aer = None
+    execute = None
 
-# Quantum register for qubits
-qr = QuantumRegister(key_size, 'q')
+try:
+    from qiskit_ibm_provider import IBMProvider
+except Exception:
+    IBMProvider = None
 
-# Classical register for bits
-cr = ClassicalRegister(key_size, 'c')
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+except Exception:
+    hashes = None
+    HKDF = None
 
-# Quantum circuit for BB84
-bb84 = QuantumCircuit(qr, cr)
+try:
+    from eth_account import Account
+    from web3 import Web3
+except Exception:
+    Account = None
+    Web3 = None
 
-# Alice generates bits
-alice_bits = [getrandbits(1) for _ in range(key_size)]
+SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
-# Alice generates bases
-alice_bases = [getrandbits(1) for _ in range(key_size)]
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("quack")
 
-# Prepare Alice's qubits
-for i in range(key_size):
-    if alice_bits[i] == 1:
-        bb84.x(qr[i])
-    if alice_bases[i] == 1:
-        bb84.h(qr[i])
+def run_bb84_simulation(key_size: int = 128):
+    """
+    Simple per-qubit BB84 simulation using Qiskit qasm_simulator.
+    Returns a sifted key bitstring (str of '0'/'1').
+    """
+    if QuantumCircuit is None or Aer is None or execute is None:
+        raise RuntimeError("Qiskit is required for BB84 simulation. Install qiskit.")
 
-# Add barrier
-bb84.barrier()
+    simulator = Aer.get_backend('qasm_simulator')
 
-# Bob chooses measurement bases
-bob_bases = [getrandbits(1) for _ in range(key_size)]
+    alice_bits = [getrandbits(1) for _ in range(key_size)]
+    alice_bases = [getrandbits(1) for _ in range(key_size)]
+    bob_bases = [getrandbits(1) for _ in range(key_size)]
+    bob_results = []
 
-# Measure (Bob's step)
-for i in range(key_size):
-    if bob_bases[i] == 1:
-        bb84.h(qr[i])
+    for i in range(key_size):
+        qc = QuantumCircuit(1, 1)
+        if alice_bits[i] == 1:
+            qc.x(0)
+        if alice_bases[i] == 1:
+            qc.h(0)
+        if bob_bases[i] == 1:
+            qc.h(0)
+        qc.measure(0, 0)
+        result = execute(qc, simulator, shots=1).result()
+        counts = result.get_counts()
+        measured = next(iter(counts.keys()))
+        bob_results.append(int(measured))
 
-for i in range(key_size):
-    bb84.measure(qr[i], cr[i])
+    # Sift
+    sifted_bits = []
+    for i in range(key_size):
+        if alice_bases[i] == bob_bases[i]:
+            sifted_bits.append(str(bob_results[i]))
 
-#Simulator
-simulator = Aer.get_backend('qasm_simulator')
+    sifted_key = ''.join(sifted_bits)
+    logger.info("BB84 complete — sifted key length: %d", len(sifted_key))
+    return sifted_key
 
-# Do the test 10 times
-for trial in range(10):
-    # Run the circuit
-    result = execute(bb84, simulator).result()
-    counts = result.get_counts()
+def fetch_quantum_bits_ibm(required_bits=256, qubits_per_job=8, shots_per_job=32, token_env='IBM_QUANTUM_TOKEN'):
+    """
+    Fetch quantum randomness from IBM Quantum backends. Returns bitstring.
+    """
+    if IBMProvider is None:
+        raise RuntimeError("qiskit-ibm-provider is required for IBM Quantum access.")
 
-    # First measurement of Bob
-    bob_first_measurements = list(counts.keys())[0]
+    token = os.getenv(token_env)
+    if not token:
+        raise RuntimeError(f"Set {token_env} environment variable with your IBM Quantum API token.")
 
-    # Obtained key
-    key = ''
-    for qubit in range(key_size):
-        if alice_bases[qubit] == bob_bases[qubit]:  # If both used the same basis
-            key += bob_first_measurements[qubit] 
+    provider = IBMProvider(instance='ibm-q', token=token)
+    backends = provider.backends(simulator=False, operational=True)
+    if not backends:
+        raise RuntimeError("No operational IBM backends available for your account.")
+    backend = backends[0]
 
-    print(key)
+    bits = []
+    while len(bits) < required_bits:
+        qc = QuantumCircuit(qubits_per_job, qubits_per_job)
+        for q in range(qubits_per_job):
+            qc.h(q)
+        qc.measure(range(qubits_per_job), range(qubits_per_job))
 
-//The above code is a simple BB84 protocol between Alice and Bob. Alice generates bits and sends them to Bob depending on a randomly chosen basis. Bob also randomly chooses a basis to measure the qubits. 
-//After this, Alice and Bob only keep the bits where they have used the same basis. 
-//They should have a matching key if no eavesdropper has disturbed the qubits.
+        job = provider.run(qc, backend=backend, shots=shots_per_job)
+        result = job.result(timeout=600)
+        counts = result.get_counts()
+        for bitstring, cnt in counts.items():
+            for _ in range(cnt):
+                bits.extend(list(bitstring))
+        # loop until enough
+    return ''.join(bits[:required_bits])
+
+def hkdf_derive_32(entropy: bytes, salt: bytes = None, info: bytes = b'quack-derive'):
+    """
+    Derive 32 bytes using HKDF-SHA256, then map deterministically into [1, n-1] for secp256k1.
+    Returns (privkey_bytes (32), salt_used).
+    """
+    if HKDF is None or hashes is None:
+        raise RuntimeError("cryptography library required for HKDF derivation.")
+
+    if salt is None:
+        salt = os.urandom(16)
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info)
+    raw = hkdf.derive(entropy)
+    k_int = int.from_bytes(raw, byteorder='big')
+    k_int = (k_int % (SECP256K1_N - 1)) + 1
+    priv = k_int.to_bytes(32, byteorder='big')
+    return priv, salt
+
+def create_eth_account_from_privkey_bytes(privkey_bytes: bytes):
+    """
+    Create eth_account Account object from raw 32 bytes.
+    Returns Account object. (eth_account required)
+    """
+    if Account is None:
+        raise RuntimeError("eth_account is required to create Ethereum accounts. Install eth-account.")
+    acct = Account.from_key(privkey_bytes)
+    return acct
+
+def integrated_flow(source: str, key_size=128, require_bits=256):
+    """
+    Integrate source -> HKDF -> Account.
+    source: 'bb84' | 'ibm' | 'file'
+    """
+    entropy = None
+    if source == 'bb84':
+        sifted = run_bb84_simulation(key_size)
+        if not sifted:
+            raise RuntimeError("Sifted key empty from BB84.")
+        # Use bitstring as bytes input: pack bits into bytes big-endian
+        bitbytes = int(sifted, 2).to_bytes((len(sifted) + 7) // 8, byteorder='big')
+        entropy = bitbytes
+    elif source == 'ibm':
+        bits = fetch_quantum_bits_ibm(required_bits=require_bits)
+        bitbytes = int(bits, 2).to_bytes((len(bits) + 7) // 8, byteorder='big')
+        entropy = bitbytes
+    elif source == 'file':
+        raise NotImplementedError("file source not yet implemented in this demo.")
+    else:
+        raise ValueError("Unknown source")
+
+    privkey_bytes, salt = hkdf_derive_32(entropy)
+    acct = create_eth_account_from_privkey_bytes(privkey_bytes)
+    return acct, salt
+
+def main():
+    parser = argparse.ArgumentParser(description="quack — quantum key demo and safe derivation (DEMO ONLY)")
+    parser.add_argument("--mode", choices=["bb84", "hkdf", "ibm", "integrated"], required=True,
+                        help="Mode to run: bb84 (sim), hkdf (derive from entropy), ibm (quantum RNG), integrated (source->HKDF->account).")
+    parser.add_argument("--key-size", type=int, default=128, help="Number of qubits / bits for BB84 simulation.")
+    parser.add_argument("--reveal-private-key", action="store_true", help="(DEMO ONLY) Print private key hex. Use only locally.")
+    parser.add_argument("--ibm-bits", type=int, default=256, help="Number of bits to fetch from IBM Quantum if mode=ibm/integrated.")
+    parser.add_argument("--entropy-file", type=str, default=None, help="Use file bytes as entropy input for hkdf mode.")
+    args = parser.parse_args()
+
+    if args.mode == "bb84":
+        sifted = run_bb84_simulation(args.key_size)
+        print("Sifted key (bits) length:", len(sifted))
+        print("Sifted key (first 128 bits, demo):", sifted[:128])
+        return
+
+    if args.mode == "hkdf":
+        if args.entropy_file is None:
+            print("Error: --entropy-file required for hkdf mode", file=sys.stderr)
+            sys.exit(2)
+        with open(args.entropy_file, "rb") as f:
+            entropy = f.read()
+        priv, salt = hkdf_derive_32(entropy)
+        acct = create_eth_account_from_privkey_bytes(priv)
+        print("Derived Ethereum address (demo):", acct.address)
+        if args.reveal_private_key:
+            print("WARNING: Revealing private key. DO NOT DO THIS FOR REAL FUNDS.")
+            print("Private key hex (demo only):", priv.hex())
+        else:
+            print("Private key hidden. Use --reveal-private-key only for local testing.")
+        print("Salt (hex) to reproduce (keep secret):", salt.hex())
+        return
+
+    if args.mode == "ibm":
+        bits = fetch_quantum_bits_ibm(required_bits=args.ibm_bits)
+        print("Fetched bits length:", len(bits))
+        print("First 128 bits (demo):", bits[:128])
+        return
+
+    if args.mode == "integrated":
+        acct, salt = integrated_flow(source="bb84", key_size=args.key_size, require_bits=args.ibm_bits)
+        print("Derived Ethereum address (demo):", acct.address)
+        if args.reveal_private_key:
+            # Only reveal when explicitly requested
+            print("Private key hex (demo only):", acct.key.hex())
+        else:
+            print("Private key not printed. Use --reveal-private-key for local debugging only.")
+        print("Salt (hex) to reproduce (keep secret):", salt.hex())
+        return
+
+if __name__ == "__main__":
+    main()
